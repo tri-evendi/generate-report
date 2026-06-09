@@ -45,10 +45,10 @@ Server fisik DAP saat ini **sangat besar secara compute & memory**, tetapi **sto
 | Instance | Core | RAM | Disk | Terpakai |
 |---|---:|---:|---:|---:|
 | Data Lake (`bliv-data-lake`) | 16 | 63 GiB | 3 TiB | ~1.0 TB (33%) |
-| Warehouse-Mart (`clickhouse-warehouse-mart`) | n/a* | 126 GiB | 6 TiB | ~0.34 TB (5.6%) |
-| **Subtotal ClickHouse** | | **189 GiB** | **9 TiB** | **~1.34 TB** |
+| Warehouse-Mart (`clickhouse-warehouse-mart`) | 32 | 126 GiB | 6 TiB | ~0.34 TB (5.6%) |
+| **Subtotal ClickHouse** | **48** | **189 GiB** | **9 TiB** | **~1.34 TB** |
 
-*\*core warehouse terpotong di screenshot — perlu konfirmasi.*
+> Alokasi terbalik: instance serving (mart) yang idle justru 2× CPU & 2× RAM dibanding lake (bronze) yang sibuk saat load.
 
 ---
 
@@ -105,6 +105,34 @@ Baseline QA = 255 GiB bronze (sebagian tabel di-exclude) → ~1 TB on-disk (part
 
 > **Kesimpulan:** tanpa replication dan dengan RAID5/6, server ini realistis menampung **hingga ~10–12 TB on-disk data ClickHouse** (≈ 8–12× volume QA). Dengan RAID10 **atau** dengan replication ×2/×3, kapasitas turun drastis dan **kemungkinan tidak cukup**. **Replication untuk HA tidak bermanfaat di satu server fisik** (hanya menggandakan data di disk yang sama, tanpa proteksi kegagalan host).
 
+### 5.1 Beban sumber baru yang sudah dipetakan (2026-06-09)
+
+Selain Oneflux (existing), 4 sumber PostgreSQL/Timescale akan diingest — total **~995 GB di sumber**:
+
+| Sumber | DB | Sumber (PG) | Est. on-disk ClickHouse |
+|---|---|---:|---:|
+| TOBA | `toba_production` | 19 GB | ~4–10 GB |
+| **NMS** | `zabbix` (+grafana) | **~953 GB** | **~50–300 GB** |
+| Datamart OF | `dm_of_dev`+`dm_of_prod` | ~14.2 GB | ~3–8 GB |
+| Airflow prod | `airflow` | ~8.6 GB | ~2–4 GB |
+| **SAP** | (TBD) | ⏳ belum diestimasi | ⏳ belum diestimasi |
+| **Total (tanpa SAP)** | | **~995 GB** | **~60–320 GB** |
+
+→ Sumber baru **sendiri masih muat** di sisa lake 2 TB (bahkan worst-case +1 TB → sisa ~1 TB). **Tetapi NMS/Zabbix 953 GB mendominasi** dan menuntut keputusan **retensi/TTL** sebelum di-load. Catatan: sumber baru semuanya PostgreSQL → CDC pakai *logical replication*, beda dari binlog Oneflux.
+
+### 5.2 Proyeksi konsolidasi data lake (update 2026-06-09)
+
+| Komponen bronze | Proyeksi actual ClickHouse |
+|---|---:|
+| **Oneflux production** (Excel × faktor inflasi 1.47×) | **~0.47 TB** |
+| Sumber PG baru (TOBA/NMS/Datamart/Airflow) | ~0.5–1.0 TB ⚠️ (perlu diukur — bukan diasumsikan terkompresi) |
+| **SAP** | ⏳ belum diestimasi (TBD) |
+| **Total proyeksi lake (tanpa SAP)** | **~1.0–1.5 TB** |
+
+*(Archive Oneflux ~0.15 TB dikelola terpisah, tidak digabung. **SAP belum masuk** — volume belum ada; berpotensi besar (ERP/HANA) dan dapat menggeser verdict.)*
+
+→ **Verdict awal:** terhadap lake 3 TB (sisa ~2 TB), muatan awal **masih cukup** — *asalkan* Zabbix diberi retensi/TTL. Faktor inflasi ClickHouse **1.47×** (terukur dari Oneflux) wajib dipakai sebagai pengali estimasi, bukan asumsi kompresi. Yang masih bisa membuat penuh: **laju pertumbuhan Zabbix** + **archive jangka panjang** (⏳ §6-E3).
+
 **Pengungkit (lever) untuk tetap muat:** kebijakan **retensi + TTL** (mis. archive ke object storage/S3 dingin), partisi by-date, dan kompresi ClickHouse (codec) — wajib didefinisikan sebelum production load.
 
 ---
@@ -117,8 +145,12 @@ Baseline QA = 255 GiB bronze (sebagian tabel di-exclude) → ~1 TB on-disk (part
 | **B** | **Jumlah server fisik** (1 atau lebih)? | Menentukan apakah HA klaster nyata atau logis; replication CH baru berarti bila ≥2 host | Infra Mitratel |
 | **C** | **DB sumber Oneflux co-located** di server ini? | Konsumsi CPU/RAM/IO bersaing dengan OLAP; pengaruhi ceiling | Infra Mitratel |
 | **D** | **Target replication factor** ClickHouse (1/2/3)? | Menggandakan kebutuhan storage; tidak berguna di single host | BTJ / Infra |
-| **E** | **Estimasi volume production + archive** (row & GiB per domain) + daftar tabel QA di-exclude | Validasi terhadap ceiling §5 | Mitratel |
-| **F** | **Core warehouse-mart** aktual (terpotong di screenshot) | Melengkapi inventaris §3.2 | Infra/BTJ |
+| **E** | **Estimasi volume production + archive** + daftar tabel QA di-exclude | Validasi terhadap ceiling §5 | Mitratel |
+| E1 | ✅ *Sebagian terjawab (2026-06-09):* sumber baru = **~995 GB** (TOBA `toba_production` 19 GB, **NMS/Zabbix ~953 GB**, Datamart `dm_of_dev`+`dm_of_prod` ~14.2 GB, Airflow ~8.6 GB) | Beban onboarding tambahan ~60–320 GB on-disk | — |
+| E2 | ✅ *Terjawab (Excel 2026-06-09):* **Oneflux production** est. **330.5 GB** → **proyeksi actual CH ~486 GB** (faktor inflasi terukur **1.47×**). Archive (est. 100.3 GB / ~148 GB CH) dikelola **terpisah**, tidak digabung. | Penentu utama lake | — |
+| E3 | 🟡 *Sebagian:* laju pertumbuhan **Oneflux ~1%/bln** (steady-state, terukur — full DB Mei 2026 ~1.85 TB, cocok dengan Excel). ⏳ *Masih menunggu:* **actual CH** sumber PG baru + **laju pertumbuhan SEMUA sumber lain** (TOBA, NMS/Zabbix, Datamart, Airflow — belum diketahui sama sekali) + kebijakan retensi/archive | Validasi akhir headroom | Mitratel/BTJ |
+| **G** | ⏳ **Estimasi volume SAP** (ERP/HANA) — sumber ke-6, **belum ada angka sama sekali**, belum masuk proyeksi ~1.0–1.5 TB | Bisa menggeser verdict kapasitas bila besar | Mitratel |
+| **F** | ✅ *Terjawab:* **core warehouse-mart = 32** (total ClickHouse = 16+32 = 48 core) | Inventaris §3.2 lengkap | — |
 
 ---
 
